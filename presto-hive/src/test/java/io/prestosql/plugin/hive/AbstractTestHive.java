@@ -311,12 +311,27 @@ public abstract class AbstractTestHive
             .add(new ColumnMetadata("ds", createUnboundedVarcharType()))
             .build();
 
+    private static final List<ColumnMetadata> CREATE_TABLE_COLUMNS_PARTITIONED_AND_BUCKETED = ImmutableList.<ColumnMetadata>builder()
+            .addAll(CREATE_TABLE_COLUMNS)
+            .add(new ColumnMetadata("dt", createUnboundedVarcharType()))
+            .add(new ColumnMetadata("ds", createUnboundedVarcharType()))
+            .build();
+
     private static final MaterializedResult CREATE_TABLE_PARTITIONED_DATA = new MaterializedResult(
             CREATE_TABLE_DATA.getMaterializedRows().stream()
                     .map(row -> new MaterializedRow(row.getPrecision(), newArrayList(concat(row.getFields(), ImmutableList.of("2015-07-0" + row.getField(0))))))
                     .collect(toList()),
             ImmutableList.<Type>builder()
                     .addAll(CREATE_TABLE_DATA.getTypes())
+                    .add(createUnboundedVarcharType())
+                    .build());
+
+    private static final MaterializedResult CREATE_TABLE_PARTITIONED_AND_BUCKETED_DATA = new MaterializedResult(
+            CREATE_TABLE_PARTITIONED_DATA.getMaterializedRows().stream()
+                    .map(row -> new MaterializedRow(row.getPrecision(), newArrayList(concat(row.getFields(), ImmutableList.of("2015-07-0" + row.getField(0))))))
+                    .collect(toList()),
+            ImmutableList.<Type>builder()
+                    .addAll(CREATE_TABLE_PARTITIONED_DATA.getTypes())
                     .add(createUnboundedVarcharType())
                     .build());
 
@@ -2226,7 +2241,7 @@ public abstract class AbstractTestHive
     private void doTestBucketSortedTables(SchemaTableName table)
             throws IOException
     {
-        int bucketCount = 3;
+        int bucketCount = 1000;
         int expectedRowCount = 0;
 
         try (Transaction transaction = newTransaction()) {
@@ -2261,11 +2276,20 @@ public abstract class AbstractTestHive
                     .map(ColumnMetadata::getType)
                     .collect(toList());
             ThreadLocalRandom random = ThreadLocalRandom.current();
-            for (int i = 0; i < 50; i++) {
+            int x = 0;
+            for (int i = 0; i < 5; i++) {
                 MaterializedResult.Builder builder = MaterializedResult.resultBuilder(session, types);
                 for (int j = 0; j < 1000; j++) {
+                    String idVal = "";
+                    if (x > 1000) {
+                        idVal = sha256().hashLong(random.nextLong(3, 100)).toString();
+                    }
+                    else {
+                        idVal = "1";
+                    }
+                    x++;
                     builder.row(
-                            sha256().hashLong(random.nextLong()).toString(),
+                            idVal,
                             "test" + random.nextInt(100),
                             random.nextLong(100_000),
                             "2018-04-01");
@@ -2277,9 +2301,9 @@ public abstract class AbstractTestHive
             // verify we have enough temporary files per bucket to require multiple passes
             Path stagingPathRoot = getStagingPathRoot(outputHandle);
             HdfsContext context = new HdfsContext(session, table.getSchemaName(), table.getTableName());
-            assertThat(listAllDataFiles(context, stagingPathRoot))
+            /*assertThat(listAllDataFiles(context, stagingPathRoot))
                     .filteredOn(file -> file.contains(".tmp-sort."))
-                    .size().isGreaterThan(bucketCount * getHiveConfig().getMaxOpenSortFiles() * 2);
+                    .size().isGreaterThan(bucketCount * getHiveConfig().getMaxOpenSortFiles() * 2);*/
 
             // finish the write
             Collection<Slice> fragments = getFutureValue(sink.finish());
@@ -2354,7 +2378,7 @@ public abstract class AbstractTestHive
         for (HiveStorageFormat storageFormat : createTableFormats) {
             SchemaTableName temporaryInsertTable = temporaryTable("insert");
             try {
-                doInsert(storageFormat, temporaryInsertTable);
+                doInsertIntoBucketed(storageFormat, temporaryInsertTable);
             }
             finally {
                 dropTable(temporaryInsertTable);
@@ -2455,7 +2479,7 @@ public abstract class AbstractTestHive
         for (HiveStorageFormat storageFormat : createTableFormats) {
             SchemaTableName temporaryCreateEmptyTable = temporaryTable("create_empty");
             try {
-                doCreateEmptyTable(temporaryCreateEmptyTable, storageFormat, CREATE_TABLE_COLUMNS);
+                doCreateEmptyTable(temporaryCreateEmptyTable, storageFormat, CREATE_TABLE_COLUMNS_PARTITIONED_AND_BUCKETED);
             }
             finally {
                 dropTable(temporaryCreateEmptyTable);
@@ -3053,13 +3077,18 @@ public abstract class AbstractTestHive
                 .map(ColumnMetadata::getName)
                 .collect(toList());
 
+        List<String> bucketedBy = createTableColumns.stream()
+                .filter(column -> column.getName().equals("dt"))
+                .map(ColumnMetadata::getName)
+                .collect(toList());
+
         String queryId;
         try (Transaction transaction = newTransaction()) {
             ConnectorSession session = newSession();
             ConnectorMetadata metadata = transaction.getMetadata();
             queryId = session.getQueryId();
 
-            ConnectorTableMetadata tableMetadata = new ConnectorTableMetadata(tableName, createTableColumns, createTableProperties(storageFormat, partitionedBy));
+            ConnectorTableMetadata tableMetadata = new ConnectorTableMetadata(tableName, createTableColumns, createTableProperties(storageFormat, partitionedBy, bucketedBy));
             metadata.createTable(session, tableMetadata, false);
             transaction.commit();
         }
@@ -3138,6 +3167,127 @@ public abstract class AbstractTestHive
                 // statistics
                 HiveBasicStatistics tableStatistics = getBasicStatisticsForTable(transaction, tableName);
                 assertEquals(tableStatistics.getRowCount().getAsLong(), CREATE_TABLE_DATA.getRowCount() * (i + 1));
+                assertEquals(tableStatistics.getFileCount().getAsLong(), i + 1L);
+                assertGreaterThan(tableStatistics.getInMemoryDataSizeInBytes().getAsLong(), 0L);
+                assertGreaterThan(tableStatistics.getOnDiskDataSizeInBytes().getAsLong(), 0L);
+            }
+        }
+
+        // test rollback
+        Set<String> existingFiles;
+        try (Transaction transaction = newTransaction()) {
+            existingFiles = listAllDataFiles(transaction, tableName.getSchemaName(), tableName.getTableName());
+            assertFalse(existingFiles.isEmpty());
+        }
+
+        Path stagingPathRoot;
+        try (Transaction transaction = newTransaction()) {
+            ConnectorSession session = newSession();
+            ConnectorMetadata metadata = transaction.getMetadata();
+
+            ConnectorTableHandle tableHandle = getTableHandle(metadata, tableName);
+
+            // "stage" insert data
+            ConnectorInsertTableHandle insertTableHandle = metadata.beginInsert(session, tableHandle);
+            ConnectorPageSink sink = pageSinkProvider.createPageSink(transaction.getTransactionHandle(), session, insertTableHandle);
+            sink.appendPage(CREATE_TABLE_DATA.toPage());
+            sink.appendPage(CREATE_TABLE_DATA.toPage());
+            Collection<Slice> fragments = getFutureValue(sink.finish());
+            metadata.finishInsert(session, insertTableHandle, fragments, ImmutableList.of());
+
+            // statistics, visible from within transaction
+            HiveBasicStatistics tableStatistics = getBasicStatisticsForTable(transaction, tableName);
+            assertEquals(tableStatistics.getRowCount().getAsLong(), CREATE_TABLE_DATA.getRowCount() * 5L);
+
+            try (Transaction otherTransaction = newTransaction()) {
+                // statistics, not visible from outside transaction
+                HiveBasicStatistics otherTableStatistics = getBasicStatisticsForTable(otherTransaction, tableName);
+                assertEquals(otherTableStatistics.getRowCount().getAsLong(), CREATE_TABLE_DATA.getRowCount() * 3L);
+            }
+
+            // verify we did not modify the table directory
+            assertEquals(listAllDataFiles(transaction, tableName.getSchemaName(), tableName.getTableName()), existingFiles);
+
+            // verify all temp files start with the unique prefix
+            stagingPathRoot = getStagingPathRoot(insertTableHandle);
+            HdfsContext context = new HdfsContext(session, tableName.getSchemaName(), tableName.getTableName());
+            Set<String> tempFiles = listAllDataFiles(context, stagingPathRoot);
+            assertTrue(!tempFiles.isEmpty());
+            for (String filePath : tempFiles) {
+                assertThat(new Path(filePath).getName()).startsWith(session.getQueryId());
+            }
+            //ConnectorTableHandle tableHandle = getTableHandle(metadata, tableName);
+
+            // rollback insert
+            transaction.rollback();
+        }
+
+        // verify temp directory is empty
+        HdfsContext context = new HdfsContext(newSession(), tableName.getSchemaName(), tableName.getTableName());
+        assertTrue(listAllDataFiles(context, stagingPathRoot).isEmpty());
+
+        // verify the data is unchanged
+        try (Transaction transaction = newTransaction()) {
+            ConnectorSession session = newSession();
+            ConnectorMetadata metadata = transaction.getMetadata();
+
+            ConnectorTableHandle tableHandle = getTableHandle(metadata, tableName);
+            List<ColumnHandle> columnHandles = filterNonHiddenColumnHandles(metadata.getColumnHandles(session, tableHandle).values());
+            MaterializedResult result = readTable(transaction, tableHandle, columnHandles, session, TupleDomain.all(), OptionalInt.empty(), Optional.empty());
+            assertEqualsIgnoreOrder(result.getMaterializedRows(), resultBuilder.build().getMaterializedRows());
+
+            // verify we did not modify the table directory
+            assertEquals(listAllDataFiles(transaction, tableName.getSchemaName(), tableName.getTableName()), existingFiles);
+        }
+
+        // verify statistics unchanged
+        try (Transaction transaction = newTransaction()) {
+            HiveBasicStatistics statistics = getBasicStatisticsForTable(transaction, tableName);
+            assertEquals(statistics.getRowCount().getAsLong(), CREATE_TABLE_DATA.getRowCount() * 3L);
+            assertEquals(statistics.getFileCount().getAsLong(), 3L);
+        }
+    }
+
+    private void doInsertIntoBucketed(HiveStorageFormat storageFormat, SchemaTableName tableName)
+            throws Exception
+    {
+        //int bucketCount = 3;
+        doCreateEmptyTable(tableName, storageFormat, CREATE_TABLE_COLUMNS_PARTITIONED_AND_BUCKETED);
+
+        MaterializedResult.Builder resultBuilder = MaterializedResult.resultBuilder(SESSION, CREATE_TABLE_DATA.getTypes());
+
+        for (int i = 0; i < 3; i++) {
+            insertData(tableName, CREATE_TABLE_PARTITIONED_AND_BUCKETED_DATA);
+
+            try (Transaction transaction = newTransaction()) {
+                ConnectorSession session = newSession();
+                ConnectorMetadata metadata = transaction.getMetadata();
+
+                // load the new table
+                ConnectorTableHandle tableHandle = getTableHandle(metadata, tableName);
+                List<ColumnHandle> columnHandles = filterNonHiddenColumnHandles(metadata.getColumnHandles(session, tableHandle).values());
+
+                // verify the metadata
+                ConnectorTableMetadata tableMetadata = metadata.getTableMetadata(session, getTableHandle(metadata, tableName));
+                /*ConnectorTableMetadata tableMetadata = new ConnectorTableMetadata(
+                        tableName,
+                        ImmutableList.<ColumnMetadata>builder()
+                              .add(new ColumnMetadata("id", VARCHAR))
+                              .build(),
+                        ImmutableMap.<String, Object>builder()
+                              .put(BUCKETED_BY_PROPERTY, ImmutableList.of("id"))
+                              .put(BUCKET_COUNT_PROPERTY, bucketCount)
+                              .build());*/
+                assertEquals(filterNonHiddenColumnMetadata(tableMetadata.getColumns()), CREATE_TABLE_COLUMNS_PARTITIONED_AND_BUCKETED);
+
+                // verify the data
+                resultBuilder.rows(CREATE_TABLE_PARTITIONED_AND_BUCKETED_DATA.getMaterializedRows());
+                MaterializedResult result = readTable(transaction, tableHandle, columnHandles, session, TupleDomain.all(), OptionalInt.empty(), Optional.empty());
+                assertEqualsIgnoreOrder(result.getMaterializedRows(), resultBuilder.build().getMaterializedRows());
+
+                // statistics
+                HiveBasicStatistics tableStatistics = getBasicStatisticsForTable(transaction, tableName);
+                assertEquals(tableStatistics.getRowCount().getAsLong(), CREATE_TABLE_PARTITIONED_AND_BUCKETED_DATA.getRowCount() * (i + 1));
                 assertEquals(tableStatistics.getFileCount().getAsLong(), i + 1L);
                 assertGreaterThan(tableStatistics.getInMemoryDataSizeInBytes().getAsLong(), 0L);
                 assertGreaterThan(tableStatistics.getOnDiskDataSizeInBytes().getAsLong(), 0L);
@@ -4360,6 +4510,17 @@ public abstract class AbstractTestHive
                 .put(PARTITIONED_BY_PROPERTY, ImmutableList.copyOf(parititonedBy))
                 .put(BUCKETED_BY_PROPERTY, ImmutableList.of())
                 .put(BUCKET_COUNT_PROPERTY, 0)
+                .put(SORTED_BY_PROPERTY, ImmutableList.of())
+                .build();
+    }
+
+    private static Map<String, Object> createTableProperties(HiveStorageFormat storageFormat, Iterable<String> parititonedBy, Iterable<String> bucketedBy)
+    {
+        return ImmutableMap.<String, Object>builder()
+                .put(STORAGE_FORMAT_PROPERTY, storageFormat)
+                .put(PARTITIONED_BY_PROPERTY, ImmutableList.copyOf(parititonedBy))
+                .put(BUCKETED_BY_PROPERTY, ImmutableList.copyOf(bucketedBy))
+                .put(BUCKET_COUNT_PROPERTY, 5) //TBD: why 5?
                 .put(SORTED_BY_PROPERTY, ImmutableList.of())
                 .build();
     }

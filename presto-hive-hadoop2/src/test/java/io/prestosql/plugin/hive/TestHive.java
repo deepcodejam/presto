@@ -37,4 +37,10 @@ public class TestHive
 
         setup(host, port, databaseName, timeZone);
     }
+
+    @Test
+    public void testSample(){
+        System.out.println("done running sample test");
+        assertTrue(true);
+    }
 }

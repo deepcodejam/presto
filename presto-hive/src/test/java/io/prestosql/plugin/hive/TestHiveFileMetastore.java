@@ -18,6 +18,7 @@ import io.prestosql.plugin.hive.authentication.NoHdfsAuthentication;
 import io.prestosql.plugin.hive.metastore.HiveMetastore;
 import io.prestosql.plugin.hive.metastore.file.FileHiveMetastore;
 import org.testng.SkipException;
+import org.testng.annotations.Test;
 
 import java.io.File;
 
@@ -64,5 +65,26 @@ public class TestHiveFileMetastore
     public void testInsertOverwriteUnpartitioned()
     {
         // FileHiveMetastore has various incompatibilities
+    }
+
+    @Test
+    public void testInsert() throws Exception
+    {
+        super.testInsert();
+        System.out.println("done running testInsert");
+    }
+
+    @Test
+    public void testEmptyTableCreation() throws Exception
+    {
+        super.testEmptyTableCreation();
+        System.out.println("done running testEmptyTableCreation");
+    }
+
+    @Test
+    public void testBucketSortedTables() throws Exception
+    {
+        super.testBucketSortedTables();
+        System.out.println("done running testBucketSortedTables");
     }
 }

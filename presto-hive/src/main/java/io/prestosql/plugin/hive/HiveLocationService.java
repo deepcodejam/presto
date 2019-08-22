@@ -56,6 +56,7 @@ public class HiveLocationService
     {
         HdfsContext context = new HdfsContext(session, schemaName, tableName);
         Path targetPath = getTableDefaultLocation(context, metastore, hdfsEnvironment, schemaName, tableName);
+        System.out.println("pathis: " + targetPath.toString());
 
         // verify the target directory for the table
         if (pathExists(context, hdfsEnvironment, targetPath)) {
